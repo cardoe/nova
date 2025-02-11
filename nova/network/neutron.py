@@ -277,6 +277,16 @@ def _ensure_no_port_binding_failure(port):
         raise exception.PortBindingFailed(port_id=port['id'])
 
 
+def _chunk_ids(ids):
+    """Split IDs into chunks small enough to filter a neutron listing on.
+
+    :param ids: A list of IDs, which may be empty.
+    :returns: A generator of lists of at most ``MAX_SEARCH_IDS`` IDs.
+    """
+    for i in range(0, len(ids), constants.MAX_SEARCH_IDS):
+        yield ids[i:i + constants.MAX_SEARCH_IDS]
+
+
 class API:
     """API for interacting with the neutron 2.x API."""
 
@@ -3440,6 +3450,67 @@ class API:
                 instance=instance
             )
 
+    def _populate_trunk_info(self, vif, current_neutron_port, context, client):
+        """Add the trunk subports of a port to its VIF model.
+
+        If the port is the parent port of a trunk, a VIF model is built for
+        each of the trunk's subports and added to the ``trunk_vifs`` of
+        ``vif``. The segmentation details of each subport are taken from the
+        parent port's ``trunk_details`` and stored as ``segmentation_id`` and
+        ``segmentation_type`` in the subport VIF's meta. Ports which are not
+        trunk parents, or all ports when ``[api] network_data_trunk_subports``
+        is disabled, are left untouched.
+
+        :param vif: The ``nova.network.model.VIF`` built from
+            ``current_neutron_port``.
+        :param current_neutron_port: The neutron port ``vif`` was built from.
+        :param context: Request context.
+        :param client: Neutron client.
+        """
+        if not CONF.api.network_data_trunk_subports:
+            return
+
+        sub_ports = current_neutron_port.get('trunk_details', {}).get(
+            'sub_ports', [])
+        if not sub_ports:
+            return
+
+        # Subports and their networks are listed in bulk, as a trunk can have
+        # hundreds of subports, in chunks so as to not exceed the maximum
+        # length of a request URI.
+        port_ids = [sub_port['port_id'] for sub_port in sub_ports]
+        ports = {
+            port['id']: port
+            for chunk in _chunk_ids(port_ids)
+            for port in client.list_ports(id=chunk).get('ports', [])}
+        if not ports:
+            return
+        net_ids = list({port['network_id'] for port in ports.values()})
+        networks = [
+            network
+            for chunk in _chunk_ids(net_ids)
+            for network in client.list_networks(id=chunk).get('networks', [])]
+
+        for sub_port in sub_ports:
+            port = ports.get(sub_port['port_id'])
+            if port is None:
+                # The subport was deleted after the trunk details were read
+                LOG.debug('Subport %(subport)s of trunk parent port '
+                          '%(parent)s no longer exists, skipping it.',
+                          {'subport': sub_port['port_id'],
+                           'parent': current_neutron_port['id']})
+                continue
+
+            # Subports are attached to the trunk rather than the instance,
+            # so nova must never delete them; mark them as preexisting.
+            subport_vif = self._build_vif_model(
+                context, client, port, networks, [port['id']])
+            subport_vif['meta']['segmentation_id'] = sub_port.get(
+                'segmentation_id')
+            subport_vif['meta']['segmentation_type'] = sub_port.get(
+                'segmentation_type')
+            vif['trunk_vifs'].append(subport_vif)
+
     def _build_network_info_model(self, context, instance, networks=None,
                                   port_ids=None, admin_client=None,
                                   preexisting_port_ids=None,
@@ -3511,6 +3582,8 @@ class API:
                     refreshed_vif = self._build_vif_model(
                         context, client, current_neutron_port, networks,
                         preexisting_port_ids)
+                    self._populate_trunk_info(
+                        refreshed_vif, current_neutron_port, context, client)
                     for index, vif in enumerate(nw_info):
                         if vif['id'] == refresh_vif_id:
                             self._log_error_if_vnic_type_changed(
@@ -3587,7 +3660,12 @@ class API:
                             vif['vnic_type'],
                             instance,
                         )
+
+                self._populate_trunk_info(
+                    vif, current_neutron_port, context, client)
+
                 nw_info.append(vif)
+
             elif nw_info_refresh:
                 LOG.info('Port %s from network info_cache is no '
                          'longer associated with instance in Neutron. '
