@@ -1,0 +1,17 @@
+---
+features:
+  - |
+    Neutron trunk subports of an instance's ports are now exposed in
+    ``network_data.json``, served by both the metadata API and the config
+    drive. Each subport is described as a ``vlan`` link on top of the link of
+    its trunk parent port, along with the networks of the subport, which
+    allows tools such as cloud-init to configure VLAN sub-interfaces in the
+    guest. Subports with a segmentation type of ``vlan`` are exposed when
+    they are on a network with subnets.
+issues:
+  - |
+    Neutron does not notify nova when subports are added to or removed from a
+    trunk, so such changes are only reflected in the metadata API after the
+    instance network info cache is next refreshed by the periodic
+    ``_heal_instance_info_cache`` task. The config drive is generated when
+    the instance is created and is not updated with later trunk changes.

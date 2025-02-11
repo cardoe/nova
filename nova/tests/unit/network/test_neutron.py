@@ -3349,6 +3349,202 @@ class TestAPI(TestAPIBase):
         mock_get_physnet.assert_has_calls([
             mock.call(self.context, mocked_client, 'net-id')] * 6)
 
+    def _setup_trunk(self, sub_ports, deleted_ports=()):
+        """Set up neutron data for an instance with one trunk parent port.
+
+        The data mirrors what neutron returns with the ML2/OVN trunk driver,
+        which also records the parent port and VLAN ID of each subport in the
+        subport's binding profile.
+
+        :param sub_ports: List of (port_id, network_id, segmentation_id)
+            tuples for the subports of the trunk. ``None`` means the port
+            has no ``trunk_details`` at all, i.e. it is not a trunk parent.
+        :param deleted_ports: IDs of subports which are in the trunk details
+            of the parent but no longer exist in neutron.
+        :returns: A tuple of the mocked neutron client, the instance and the
+            list of networks.
+        """
+        for name, return_value in (
+                ('_get_physnet_tunneled_info', (None, False)),
+                ('_get_preexisting_port_ids', []),
+                ('_get_subnets_from_port', [model.Subnet(cidr='10.0.0.0/24')]),
+                ('_get_floating_ips_by_fixed_and_port', [])):
+            patcher = mock.patch.object(
+                neutronapi.API, name, return_value=return_value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        mocked_client = mock.create_autospec(client.Client)
+        patcher = mock.patch.object(
+            neutronapi, 'get_client', return_value=mocked_client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        inst = objects.Instance(
+            project_id=uuids.project, uuid=uuids.instance)
+        inst.info_cache = objects.InstanceInfoCache.new(
+            self.context, uuids.instance)
+        inst.info_cache.network_info = model.NetworkInfo()
+
+        parent_port = {
+            'id': uuids.parent_port,
+            'network_id': uuids.parent_net,
+            'tenant_id': uuids.project,
+            'device_id': uuids.instance,
+            'device_owner': 'compute:nova',
+            'admin_state_up': True,
+            'status': 'ACTIVE',
+            'fixed_ips': [{'ip_address': '10.0.0.10',
+                           'subnet_id': uuids.parent_subnet}],
+            'mac_address': 'fa:16:3e:00:00:01',
+            'binding:vif_type': model.VIF_TYPE_OVS,
+            'binding:vnic_type': model.VNIC_TYPE_NORMAL,
+            constants.BINDING_PROFILE: {},
+            'binding:vif_details': {},
+        }
+        if sub_ports is not None:
+            parent_port['trunk_details'] = {
+                'trunk_id': uuids.trunk,
+                'sub_ports': [
+                    {'port_id': port_id,
+                     'segmentation_type': 'vlan',
+                     'segmentation_id': seg_id,
+                     'mac_address': 'fa:16:3e:00:01:%02x' % seg_id}
+                    for port_id, _, seg_id in sub_ports],
+            }
+
+        neutron_ports = {}
+        neutron_nets = {
+            uuids.parent_net: {'id': uuids.parent_net, 'name': 'parent',
+                               'tenant_id': uuids.project}}
+        for port_id, net_id, seg_id in sub_ports or []:
+            neutron_nets[net_id] = {
+                'id': net_id, 'name': 'vlan%d' % seg_id,
+                'tenant_id': uuids.project}
+            if port_id in deleted_ports:
+                continue
+            neutron_ports[port_id] = {
+                'id': port_id,
+                'network_id': net_id,
+                'tenant_id': uuids.project,
+                # Subports are owned by the trunk, not the instance
+                'device_id': uuids.trunk,
+                'device_owner': 'trunk:subport',
+                'admin_state_up': True,
+                'status': 'ACTIVE',
+                'fixed_ips': [{'ip_address': '10.0.%d.10' % seg_id,
+                               'subnet_id': uuids.subport_subnet}],
+                'mac_address': 'fa:16:3e:00:01:%02x' % seg_id,
+                'binding:vif_type': model.VIF_TYPE_OVS,
+                'binding:vnic_type': model.VNIC_TYPE_NORMAL,
+                constants.BINDING_PROFILE: {
+                    'parent_name': uuids.parent_port, 'tag': seg_id},
+                'binding:vif_details': {},
+            }
+
+        def list_ports(id=None, **kwargs):
+            if id is None:
+                return {'ports': [parent_port]}
+            return {'ports': [neutron_ports[port_id] for port_id in id
+                              if port_id in neutron_ports]}
+
+        def list_networks(id, **kwargs):
+            return {'networks': [neutron_nets[net_id] for net_id in id]}
+
+        mocked_client.list_ports.side_effect = list_ports
+        mocked_client.list_networks.side_effect = list_networks
+
+        return mocked_client, inst, [neutron_nets[uuids.parent_net]]
+
+    def test_build_network_info_model_trunk(self):
+        mocked_client, inst, nets = self._setup_trunk(
+            [(uuids.subport1, uuids.subport_net1, 101),
+             (uuids.subport2, uuids.subport_net2, 102)])
+
+        nw_info = self.api._build_network_info_model(
+            self.context, inst, nets, [uuids.parent_port],
+            preexisting_port_ids=[])
+
+        # The subports and their networks are each fetched in one call
+        mocked_client.list_ports.assert_has_calls([
+            mock.call(tenant_id=uuids.project, device_id=uuids.instance),
+            mock.call(id=[uuids.subport1, uuids.subport2])])
+        mocked_client.list_networks.assert_called_once_with(id=mock.ANY)
+        self.assertCountEqual(
+            [uuids.subport_net1, uuids.subport_net2],
+            mocked_client.list_networks.call_args.kwargs['id'])
+
+        # Subports are nested under their parent, not top level VIFs
+        self.assertEqual([uuids.parent_port], [vif['id'] for vif in nw_info])
+        trunk_vifs = nw_info[0]['trunk_vifs']
+        self.assertEqual([uuids.subport1, uuids.subport2],
+                         [vif['id'] for vif in trunk_vifs])
+        for trunk_vif, net_id, seg_id in zip(
+                trunk_vifs, (uuids.subport_net1, uuids.subport_net2),
+                (101, 102)):
+            self.assertEqual(net_id, trunk_vif['network']['id'])
+            self.assertEqual('fa:16:3e:00:01:%02x' % seg_id,
+                             trunk_vif['address'])
+            self.assertEqual(
+                {'segmentation_id': seg_id, 'segmentation_type': 'vlan'},
+                trunk_vif['meta'])
+            # Subports belong to the trunk, so nova must never delete them
+            self.assertTrue(trunk_vif['preserve_on_delete'])
+
+    def _test_build_network_info_model_trunk_no_subports(
+            self, sub_ports, deleted_ports=()):
+        mocked_client, inst, nets = self._setup_trunk(
+            sub_ports, deleted_ports)
+
+        nw_info = self.api._build_network_info_model(
+            self.context, inst, nets, [uuids.parent_port],
+            preexisting_port_ids=[])
+
+        # Make sure every network of the project isn't listed
+        mocked_client.list_networks.assert_not_called()
+        self.assertEqual([uuids.parent_port], [vif['id'] for vif in nw_info])
+        self.assertEqual([], nw_info[0]['trunk_vifs'])
+
+    def test_build_network_info_model_not_trunk(self):
+        self._test_build_network_info_model_trunk_no_subports(None)
+
+    def test_build_network_info_model_trunk_no_subports(self):
+        self._test_build_network_info_model_trunk_no_subports([])
+
+    def test_build_network_info_model_trunk_all_subports_deleted(self):
+        self._test_build_network_info_model_trunk_no_subports(
+            [(uuids.subport1, uuids.subport_net1, 101)],
+            deleted_ports=[uuids.subport1])
+
+    def test_build_network_info_model_trunk_subport_deleted(self):
+        # subport1 was deleted after neutron returned the trunk details
+        mocked_client, inst, nets = self._setup_trunk(
+            [(uuids.subport1, uuids.subport_net1, 101),
+             (uuids.subport2, uuids.subport_net2, 102)],
+            deleted_ports=[uuids.subport1])
+
+        nw_info = self.api._build_network_info_model(
+            self.context, inst, nets, [uuids.parent_port],
+            preexisting_port_ids=[])
+
+        mocked_client.list_networks.assert_called_once_with(
+            id=[uuids.subport_net2])
+        self.assertEqual([uuids.subport2],
+                         [vif['id'] for vif in nw_info[0]['trunk_vifs']])
+
+    def test_build_network_info_model_trunk_refresh_vif_id(self):
+        mocked_client, inst, nets = self._setup_trunk(
+            [(uuids.subport1, uuids.subport_net1, 101)])
+        # The cached VIF of the parent port predates the subport
+        inst.info_cache.network_info = model.NetworkInfo(
+            [model.VIF(id=uuids.parent_port)])
+
+        nw_info = self.api._build_network_info_model(
+            self.context, inst, refresh_vif_id=uuids.parent_port)
+
+        self.assertEqual([uuids.parent_port], [vif['id'] for vif in nw_info])
+        self.assertEqual([uuids.subport1],
+                         [vif['id'] for vif in nw_info[0]['trunk_vifs']])
+
     @mock.patch.object(neutronapi, 'get_client')
     @mock.patch('nova.network.neutron.API._nw_info_get_subnets')
     @mock.patch('nova.network.neutron.API._nw_info_get_ips')
