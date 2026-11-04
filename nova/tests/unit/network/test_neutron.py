@@ -2956,7 +2956,8 @@ class TestAPI(TestAPIBase):
         self.assertEqual(1, len(subnets))
         self.assertEqual(1, len(subnets[0]['ips']))
         self.assertEqual('1.1.1.1', subnets[0]['ips'][0]['address'])
-        mock_get_subnets.assert_called_once_with(self.context, fake_port, None)
+        mock_get_subnets.assert_called_once_with(
+            self.context, fake_port, None, None)
 
     @mock.patch.object(neutronapi.API, '_get_physnet_tunneled_info',
                        return_value=(None, False))
@@ -3269,7 +3270,7 @@ class TestAPI(TestAPIBase):
         expected_get_subnets_calls = []
         for requested_port in requested_ports:
             expected_get_subnets_calls.append(
-                mock.call(self.context, requested_port, mocked_client))
+                mock.call(self.context, requested_port, mocked_client, None))
 
         fake_inst.info_cache = objects.InstanceInfoCache.new(
             self.context, uuids.instance)
@@ -3366,27 +3367,23 @@ class TestAPI(TestAPIBase):
         :param parent_fixed_ips: The fixed IPs of the parent port, defaults
             to a single IPv4 address.
         :returns: A tuple of the mocked neutron client, the instance and the
-            list of networks.
+            list of networks. The per port lookups of the physnet and the
+            floating IPs, which subports must not use, are mocked as
+            ``self.mock_get_physnet`` and ``self.mock_get_floating``.
         """
         self.flags(network_data_trunk_subports=True, group='api')
 
-        def get_subnets_from_port(context, port, client=None):
-            # Like neutron, a port only has subnets for its fixed IPs
-            return [model.Subnet(
-                        cidr=ip['ip_address'].rsplit('.', 1)[0] + '.0/24')
-                    for ip in port['fixed_ips']]
-
-        for name, kwargs in (
-                ('_get_physnet_tunneled_info',
-                 {'return_value': (None, False)}),
-                ('_get_preexisting_port_ids', {'return_value': []}),
-                ('_get_subnets_from_port',
-                 {'side_effect': get_subnets_from_port}),
-                ('_get_floating_ips_by_fixed_and_port',
-                 {'return_value': []})):
-            patcher = mock.patch.object(neutronapi.API, name, **kwargs)
-            patcher.start()
+        mocks = {}
+        for name, return_value in (
+                ('_get_physnet_tunneled_info', (None, False)),
+                ('_get_preexisting_port_ids', []),
+                ('_get_floating_ips_by_fixed_and_port', [])):
+            patcher = mock.patch.object(
+                neutronapi.API, name, return_value=return_value)
+            mocks[name] = patcher.start()
             self.addCleanup(patcher.stop)
+        self.mock_get_physnet = mocks['_get_physnet_tunneled_info']
+        self.mock_get_floating = mocks['_get_floating_ips_by_fixed_and_port']
         mocked_client = mock.create_autospec(client.Client)
         patcher = mock.patch.object(
             neutronapi, 'get_client', return_value=mocked_client)
@@ -3432,10 +3429,36 @@ class TestAPI(TestAPIBase):
         neutron_nets = {
             uuids.parent_net: {'id': uuids.parent_net, 'name': 'parent',
                                'tenant_id': uuids.project}}
+        neutron_subnets = {}
+        dhcp_ports = []
+        floating_ips = []
+
+        def add_subnet(subnet_id, net_id, prefix):
+            neutron_subnets[subnet_id] = {
+                'id': subnet_id, 'network_id': net_id,
+                'cidr': prefix + '.0/24', 'gateway_ip': prefix + '.1',
+                'enable_dhcp': True, 'dns_nameservers': [],
+                'host_routes': []}
+            dhcp_ports.append({
+                'network_id': net_id, 'device_owner': 'network:dhcp',
+                'fixed_ips': [{'subnet_id': subnet_id,
+                               'ip_address': prefix + '.2'}]})
+
+        add_subnet(uuids.parent_subnet, uuids.parent_net, '10.0.0')
         for port_id, net_id, seg_id in sub_ports or []:
+            subnet_id = getattr(uuids, 'subport_subnet%d' % seg_id)
+            # Admins are also given the provider attributes of networks
             neutron_nets[net_id] = {
                 'id': net_id, 'name': 'vlan%d' % seg_id,
-                'tenant_id': uuids.project}
+                'tenant_id': uuids.project,
+                'provider:physical_network': 'physnet1',
+                'provider:network_type': 'vlan',
+                'provider:segmentation_id': seg_id}
+            add_subnet(subnet_id, net_id, '10.0.%d' % seg_id)
+            floating_ips.append({
+                'port_id': port_id,
+                'fixed_ip_address': '10.0.%d.10' % seg_id,
+                'floating_ip_address': '172.24.4.%d' % seg_id})
             if port_id in deleted_ports:
                 continue
             neutron_ports[port_id] = {
@@ -3448,7 +3471,7 @@ class TestAPI(TestAPIBase):
                 'admin_state_up': True,
                 'status': 'ACTIVE',
                 'fixed_ips': [{'ip_address': '10.0.%d.10' % seg_id,
-                               'subnet_id': uuids.subport_subnet}],
+                               'subnet_id': subnet_id}],
                 'mac_address': 'fa:16:3e:00:01:%02x' % seg_id,
                 'binding:vif_type': model.VIF_TYPE_OVS,
                 'binding:vnic_type': model.VNIC_TYPE_NORMAL,
@@ -3457,7 +3480,14 @@ class TestAPI(TestAPIBase):
                 'binding:vif_details': {},
             }
 
-        def list_ports(id=None, **kwargs):
+        def ids(value):
+            return value if isinstance(value, list) else [value]
+
+        def list_ports(id=None, network_id=None, device_owner=None,
+                       **kwargs):
+            if device_owner == 'network:dhcp':
+                return {'ports': [port for port in dhcp_ports
+                                  if port['network_id'] in ids(network_id)]}
             if id is None:
                 return {'ports': [parent_port]}
             return {'ports': [neutron_ports[port_id] for port_id in id
@@ -3466,8 +3496,18 @@ class TestAPI(TestAPIBase):
         def list_networks(id, **kwargs):
             return {'networks': [neutron_nets[net_id] for net_id in id]}
 
+        def list_subnets(id, **kwargs):
+            return {'subnets': [subnet for subnet in neutron_subnets.values()
+                                if subnet['id'] in id]}
+
+        def list_floatingips(port_id, **kwargs):
+            return {'floatingips': [fip for fip in floating_ips
+                                    if fip['port_id'] in ids(port_id)]}
+
         mocked_client.list_ports.side_effect = list_ports
         mocked_client.list_networks.side_effect = list_networks
+        mocked_client.list_subnets.side_effect = list_subnets
+        mocked_client.list_floatingips.side_effect = list_floatingips
 
         return mocked_client, inst, [neutron_nets[uuids.parent_net]]
 
@@ -3480,14 +3520,32 @@ class TestAPI(TestAPIBase):
             self.context, inst, nets, [uuids.parent_port],
             preexisting_port_ids=[])
 
-        # The subports and their networks are each fetched in one call
+        # Everything about the subports is fetched in one call per resource
+        # type, rather than per subport
         mocked_client.list_ports.assert_has_calls([
-            mock.call(tenant_id=uuids.project, device_id=uuids.instance),
-            mock.call(id=[uuids.subport1, uuids.subport2])])
+            mock.call(id=[uuids.subport1, uuids.subport2]),
+            mock.call(network_id=mock.ANY, device_owner='network:dhcp')])
+        self.assertCountEqual(
+            [uuids.subport_net1, uuids.subport_net2],
+            mocked_client.list_ports.call_args.kwargs['network_id'])
         mocked_client.list_networks.assert_called_once_with(id=mock.ANY)
         self.assertCountEqual(
             [uuids.subport_net1, uuids.subport_net2],
             mocked_client.list_networks.call_args.kwargs['id'])
+        mocked_client.list_subnets.assert_called_with(id=mock.ANY)
+        self.assertCountEqual(
+            [uuids.subport_subnet101, uuids.subport_subnet102],
+            mocked_client.list_subnets.call_args.kwargs['id'])
+        mocked_client.list_floatingips.assert_called_once_with(
+            port_id=[uuids.subport1, uuids.subport2])
+        # Besides listing the instance's ports, only the parent port's own
+        # subnets and DHCP ports are looked up separately
+        self.assertEqual(4, mocked_client.list_ports.call_count)
+        self.assertEqual(2, mocked_client.list_subnets.call_count)
+        self.mock_get_physnet.assert_called_once_with(
+            self.context, mocked_client, uuids.parent_net)
+        self.mock_get_floating.assert_called_once_with(
+            mocked_client, '10.0.0.10', uuids.parent_port)
 
         # Subports are nested under their parent, not top level VIFs
         self.assertEqual([uuids.parent_port], [vif['id'] for vif in nw_info])
@@ -3503,6 +3561,17 @@ class TestAPI(TestAPIBase):
             self.assertEqual(
                 {'segmentation_id': seg_id, 'segmentation_type': 'vlan'},
                 trunk_vif['meta'])
+            self.assertEqual('physnet1',
+                             trunk_vif['network']['meta']['physical_network'])
+            self.assertFalse(trunk_vif['network']['meta']['tunneled'])
+            subnet = trunk_vif['network']['subnets'][0]
+            self.assertEqual('10.0.%d.0/24' % seg_id, subnet['cidr'])
+            self.assertEqual('10.0.%d.2' % seg_id,
+                             subnet.get_meta('dhcp_server'))
+            self.assertEqual(['10.0.%d.10' % seg_id],
+                             [ip['address'] for ip in subnet['ips']])
+            self.assertEqual(['172.24.4.%d' % seg_id],
+                             [ip['address'] for ip in trunk_vif.floating_ips()])
             # Subports belong to the trunk, so nova must never delete them
             self.assertTrue(trunk_vif['preserve_on_delete'])
 
@@ -3530,9 +3599,13 @@ class TestAPI(TestAPIBase):
             preexisting_port_ids=[])
 
         # Nothing about the subports is fetched from neutron
-        mocked_client.list_ports.assert_called_once_with(
-            tenant_id=uuids.project, device_id=uuids.instance)
+        mocked_client.list_ports.assert_has_calls([
+            mock.call(tenant_id=uuids.project, device_id=uuids.instance),
+            mock.call(network_id=uuids.parent_net,
+                      device_owner='network:dhcp')])
+        self.assertEqual(2, mocked_client.list_ports.call_count)
         mocked_client.list_networks.assert_not_called()
+        mocked_client.list_floatingips.assert_not_called()
         self.assertEqual([], nw_info[0]['trunk_vifs'])
 
     def test_build_network_info_model_not_trunk(self):
@@ -3563,6 +3636,16 @@ class TestAPI(TestAPIBase):
             mock.call(id=port_ids[:constants.MAX_SEARCH_IDS]),
             mock.call(id=port_ids[constants.MAX_SEARCH_IDS:])])
         self.assertEqual(2, mocked_client.list_networks.call_count)
+        # So is everything else the subport VIF models are built from, which
+        # the parent port's own lookups use no list of IDs for
+        for list_func, key in ((mocked_client.list_subnets, 'id'),
+                               (mocked_client.list_ports, 'network_id'),
+                               (mocked_client.list_floatingips, 'port_id')):
+            self.assertEqual(
+                [constants.MAX_SEARCH_IDS, 1],
+                [len(call.kwargs[key]) for call in list_func.call_args_list
+                 if isinstance(call.kwargs.get(key), list) and
+                 uuids.parent_subnet not in call.kwargs[key]])
         self.assertEqual(port_ids,
                          [vif['id'] for vif in nw_info[0]['trunk_vifs']])
 
@@ -3604,8 +3687,8 @@ class TestAPI(TestAPIBase):
         self.assertEqual(101, vlan_link['vlan_id'])
         # Only the subport has a network
         self.assertEqual(
-            [(vlan_link['id'], uuids.subport_net1, '10.0.101.10')],
-            [(net['link'], net['network_id'], net['ip_address'])
+            [(vlan_link['id'], uuids.subport_net1)],
+            [(net['link'], net['network_id'])
              for net in net_metadata['networks']])
 
     def test_build_network_info_model_trunk_refresh_vif_id(self):
